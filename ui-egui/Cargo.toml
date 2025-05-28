@@ -1,0 +1,18 @@
+[package]
+name = "emu-ui-egui"
+version = "0.1.0"
+edition = "2024"
+default-run = "emu-ui-egui"
+
+[dependencies]
+emu-backend = { path = "../backend" }
+
+eframe = { version = "0.31.1", features = ["glow"] }
+egui = { version = "0.31.1", features = ["log"] }
+egui_extras = { version = "0.31.1", features = ["default", "image"] }
+env_logger = { version = "0.11.8", default-features = false, features = [
+    "auto-color",
+    "humantime",
+] }
+log = "0.4.27"
+rodio = { version = "0.20.1", default-features = false }

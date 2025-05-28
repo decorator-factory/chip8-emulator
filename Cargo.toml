@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["backend", "ui-egui"]
+
+[profile.dev.package.egui]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+debug = "full"
+panic = "unwind"
+lto = "thin"
+
+[profile.test]
+opt-level = 2
+lto = "off"
