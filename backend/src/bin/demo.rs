@@ -11,7 +11,7 @@ fn main() {
     let start = Instant::now();
     let count = vm.execute_bounded(2_000_000_000, ());
     let dt = start.elapsed();
-    vm.debug_screen();
+    vm.print_debug_screen();
 
     let mips = (count as f64 / dt.as_secs_f64()) / 1_000_000.;
 

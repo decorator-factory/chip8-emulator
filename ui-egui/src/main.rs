@@ -120,13 +120,13 @@ fn run_emulator(display_tx: mpsc::SyncSender<EmuUI>, upd_rx: mpsc::Receiver<Upda
             Ok(Update::Keyboard(keys)) => vm.set_keyboard(keys),
             Ok(Update::CoreDump) => {
                 println!("{vm:?}");
-                vm.core_dump();
+                vm.print_core_dump();
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => break,
         }
     }
-    vm.core_dump();
+    vm.print_core_dump();
     println!("Done; {vm:?}");
 }
 

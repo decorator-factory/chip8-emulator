@@ -92,6 +92,9 @@ const fn n3(value: u16) -> u8 {
 
 // Breakpoints
 
+/// Type representing a collection of breakpoints. It's represented as a trait
+/// to avoid doing a check on every step of interpreter when we don't have any
+/// breakpoints.
 pub trait Breakpoints {
     fn should_break(&self, adr: u16) -> bool;
 }
@@ -122,15 +125,62 @@ where
 }
 
 impl Breakpoints for () {
+    // No breakpoints
     #[inline(always)]
     fn should_break(&self, _adr: u16) -> bool {
         false
     }
 }
 
-// Interpreter
+
 
 impl Interpreter {
+    /// Load a program, starting from address 0x200.
+    ///
+    /// Panics if the program does not fit into the memory.
+    pub fn load_rom(&mut self, rom: &[u8]) {
+        let start_pos = 0x200;
+        if rom.len() >= self.memory.len() - start_pos {
+            // TODO: proper error reporting
+            panic!("ROM is too large");
+        }
+        self.memory[start_pos..start_pos + rom.len()].copy_from_slice(rom);
+    }
+
+    /// Executes the program with a limit to the number of instrunctions.
+    ///
+    /// Stops when either condition is met:
+    /// - `limit` instructions have been executed
+    /// - the program is in an infinite busy loop (1NNN instruction pointing at itself)
+    /// - a breakpoint has been hit
+    ///
+    /// Returns the number of instructions executed
+    pub fn execute_bounded(&mut self, limit: u64, bp: impl Breakpoints) -> u64 {
+        let pc_limit = (self.memory.len() - 1) as u16;
+        for i in 0..limit {
+            if self.pc >= pc_limit {
+                // TODO: proper error reporting
+                panic!("pc too large")
+            }
+
+            // SAFETY: we just checked the bounds
+            let instr_high = unsafe { *self.memory.get_unchecked(self.pc as usize) };
+            let instr_low = unsafe { *self.memory.get_unchecked(self.pc as usize + 1) };
+            let instr = ((instr_high as u16) << 8) + (instr_low as u16);
+
+            let old_pc = self.pc;
+            self.pc = self.exec_instruction(instr);
+            if self.pc == old_pc {
+                return i;
+            }
+
+            if bp.should_break(self.pc) {
+                return i + 1;
+            }
+        }
+        limit
+    }
+
     #[inline(always)]
     pub fn pc(&self) -> u16 {
         self.pc
@@ -188,43 +238,10 @@ impl Interpreter {
         unsafe { *self.registers.get_unchecked_mut((at & 0xf) as usize) = value }
     }
 
-    pub fn load_rom(&mut self, rom: &[u8]) {
-        let start_pos = 0x200;
-        if rom.len() >= self.memory.len() - start_pos {
-            // TODO: proper error reporting
-            panic!("ROM too large");
-        }
-        self.memory[0x200..0x200 + rom.len()].copy_from_slice(rom);
-    }
-
-    pub fn execute_bounded(&mut self, limit: u64, bp: impl Breakpoints) -> u64 {
-        let pc_limit = (self.memory.len() - 1) as u16;
-        for i in 0..limit {
-            if self.pc >= pc_limit {
-                // TODO: proper error reporting
-                panic!("pc too large")
-            }
-
-            // SAFETY: we just checked the bounds
-            let instr_high = unsafe { *self.memory.get_unchecked(self.pc as usize) };
-            let instr_low = unsafe { *self.memory.get_unchecked(self.pc as usize + 1) };
-            let instr = ((instr_high as u16) << 8) + (instr_low as u16);
-
-            let old_pc = self.pc;
-            self.pc = self.exec_instruction(instr);
-            if self.pc == old_pc {
-                return i;
-            }
-
-            if bp.should_break(self.pc) {
-                return i + 1;
-            }
-        }
-        limit
-    }
-
-    #[inline(always)]  // Load-bearing inline: 2x overall speedup on 1dcell_benchmark
+    #[inline(always)] // Load-bearing inline: 2x overall speedup on 1dcell_benchmark
     pub fn exec_instruction(&mut self, instr: u16) -> u16 {
+        // Returns the next IP value.
+        //
         // For reference, see https://github.com/mattmikolay/chip-8/wiki/CHIP‐8-Instruction-Set
 
         match n0(instr) {
@@ -236,6 +253,7 @@ impl Interpreter {
                     self.display.fill(0);
 
                 } else if instr == 0x00ee {
+                    // 00EE: return from subroutine
                     if self.sp >= 16 {
                         // TODO: proper error reporting
                         todo!("Stack underflow at pc={}", self.pc)
@@ -246,22 +264,18 @@ impl Interpreter {
                     return ret_adr;
 
                 } else {
-                    let syscall = instr & 0xfff;
-                    if syscall & 0x0f00 == 0x0f00 {
-                        println!();
-                        println!("{0:02x} {1:?}", syscall & 0xff, &self);
-                        self.core_dump();
-                        println!();
-                    } else {
-                        // TODO: proper error reporting
-                        todo!("Unknown syscall={syscall:04x}")
-                    }
+                    // TODO: proper error reporting
+                    todo!("Unknown machine subroutine: {instr:04x}")
                 }
             }
             1 => {
+                // 1NNN: Jump to address NNN
+
                 return instr & 0xfff;
             }
             2 => {
+                // 2NNN: Execute subroutine starting at NNN
+
                 let addr = instr & 0xfff;
                 self.sp = self.sp.wrapping_add(1);
                 if self.sp >= 16 {
@@ -273,11 +287,15 @@ impl Interpreter {
                 return addr;
             }
             3 => {
+                // 3XNN: Skip the following instruction if the value of register VX equals NN
+
                 if self.reg(n1(instr)) == (instr & 0xff) as u8 {
                     return self.pc.wrapping_add(4)
                 }
             }
             4 => {
+                // 4XNN: Skip the following instruction if the value of register VX does not equal NN
+
                 if self.reg(n1(instr)) != (instr & 0xff) as u8 {
                     return self.pc.wrapping_add(4)
                 }
@@ -287,47 +305,72 @@ impl Interpreter {
                     // TODO: proper error reporting
                     todo!("Invalid instruction {:04x} at pc={:04x}", instr, self.pc)
                 }
+                // 5XY0: Skip the following instruction if the value of register VX is
+                //       equal to the value of register VY
                 if self.reg(n1(instr)) == self.reg(n2(instr)) {
                     return self.pc.wrapping_add(4)
                 }
             }
             6 => {
+                // 6XNN: Store number NN in register VX
+
                 self.set_reg(n1(instr), (instr & 0xff) as u8);
             }
             7 => {
+                // 7XNN: Add the value NN to register VX
+
                 let adr = n1(instr);
                 let new_value = self.reg(adr).wrapping_add((instr & 0xff) as u8);
                 self.set_reg(adr, new_value);
             }
             8 => {
+                // 8XYZ: perform arithmetic/logical operation, storing the result in VX
+
                 let vx = n1(instr);
                 let x = self.reg(vx);
                 let y = self.reg(n2(instr));
                 match n3(instr) {
-                    0 => self.set_reg(vx, y),
-                    1 => self.set_reg(vx, x | y),
-                    2 => self.set_reg(vx, x & y),
-                    3 => self.set_reg(vx, x ^ y),
+                    0 => {
+                        // VX := VY
+                        self.set_reg(vx, y)
+                    },
+                    1 => {
+                        // VX := VX or VY
+                        self.set_reg(vx, x | y)
+                    },
+                    2 => {
+                        // VX := VX and VY
+                        self.set_reg(vx, x & y)
+                    },
+                    3 => {
+                        // VX := VX xor VY
+                        self.set_reg(vx, x ^ y)
+                    },
                     4 => {
+                        // VX := VX + VY,  VF = carry ? 1 : 0
                         let (new_x, carry) = x.overflowing_add(y);
                         self.set_reg(vx, new_x);
                         self.set_reg(15, carry as u8);
                     },
                     5 => {
+                        // VX := VX - VY; VF = borrow ? 0 : 1
                         let (new_x, borrow) = x.overflowing_sub(y);
                         self.set_reg(vx, new_x);
                         self.set_reg(15, (!borrow) as u8);
                     },
                     6 => {
+                        // VF = least significant bit of VY; VX := VY >> 1
                         self.set_reg(vx, x >> 1);
                         self.set_reg(15, (x & 1 != 0) as u8);
                     },
                     7 => {
+                        // VX := VY - VX; VF = borrow ? 0 : 1
                         let (new_x, borrow) = y.overflowing_sub(x);
                         self.set_reg(vx, new_x);
                         self.set_reg(15, (!borrow) as u8);
                     },
                     0xE => {
+                        // VF = most significant bit of VY; VX := VY << 1
                         self.set_reg(vx, x << 1);
                         self.set_reg(15, (x & 0b10000000 != 0) as u8);
                     },
@@ -343,21 +386,34 @@ impl Interpreter {
                     // TODO: proper error reporting
                     todo!("Invalid instruction {:04x} at pc={:04x}", instr, self.pc)
                 }
+                // 9XY0: Skip the following instruction if the value of register VX
+                //       is not equal to the value of register VY
                 if self.reg(n1(instr)) != self.reg(n2(instr)) {
                     return self.pc.wrapping_add(4)
                 }
             }
             0xA => {
+                // ANNN: Store memory address NNN in register I
+
                 self.vi = instr & 0xfff;
             }
             0xB => {
+                // BNNN: Jump to address NNN + V0
+
                 return (instr & 0xfff).wrapping_add(self.reg(0) as u16);
             }
             0xC => {
+                // CXNN: Set VX to a random number with a mask of NN
+
                 let random = self.advance_random();
                 self.set_reg(n1(instr), random & ((instr & 0xff) as u8));
             }
             0xD => {
+                // DXYN: Draw a sprite at position VX, VY with N bytes of
+                //       sprite data starting at the address stored in I.
+                //       Set VF to 01 if any set pixels are changed to unset,
+                //       and 00 otherwise
+
                 let x = self.reg(n1(instr)) as usize % 64;
                 let y = self.reg(n2(instr)) as usize % 32;
                 let sprite_height = (n3(instr) as usize).min((32 + 1) - y);
@@ -397,12 +453,18 @@ impl Interpreter {
             0xE => {
                 match (instr & 0xff) as u8 {
                     0x9e => {
+                        // EX9E: Skip the following instruction if the key corresponding
+                        //       to the hex value currently stored in register VX is pressed
+
                         let reg = self.reg(n1(instr)) & 0xf;
                         if self.keyboard & (1 << reg) != 0 {
                             return self.pc + 4
                         }
                     }
                     0xa1 => {
+                        // EXA1: Skip the following instruction if the key corresponding
+                        //       to the hex value currently stored in register VX is NOT pressed
+
                         let reg = self.reg(n1(instr)) & 0xf;
                         if self.keyboard & (1 << reg) == 0 {
                             return self.pc + 4
@@ -417,9 +479,13 @@ impl Interpreter {
             _ /* F */ => {
                 match (instr & 0xff) as u8 {
                     0x07 => {
+                        // FX07: Store the current value of the delay timer in register VX
+
                         self.set_reg(n1(instr), self.timer);
                     },
                     0x0a => {
+                        // FX0A: Wait for a keypress and store the result in register VX
+
                         if self.new_key & 0xf0 != 0 {
                             if self.new_key == 0xff {
                                 self.new_key = 0xfe;
@@ -431,18 +497,30 @@ impl Interpreter {
                         self.new_key = 0xff;
                     },
                     0x15 => {
+                        // FX15: Set the delay timer to the value of register VX
+
                         self.timer = self.reg(n1(instr));
                     },
                     0x18 => {
+                        // FX18: Set the sound timer to the value of register VX
+
                         self.audio_timer = self.reg(n1(instr));
                     },
                     0x1e => {
+                        // FX1E: Add the value stored in register VX to register I
+
                         self.vi = self.vi.wrapping_add(self.reg(n1(instr)) as u16);
                     },
                     0x29 => {
+                        // FX29: Set I to the memory address of the sprite data
+                        //       corresponding to the hexadecimal digit stored in register VX
+
                         self.vi = DIGIT_OFFSETS[(self.reg(n1(instr)) & 0x0f) as usize] + DIGITS_BEGIN;
                     }
                     0x33 => {
+                        // FX33: Store the binary-coded decimal equivalent of the value stored
+                        //       in register VX at addresses I, I + 1, and I + 2
+
                         let val = self.reg(n1(instr));
                         let vi = self.vi as usize;
                         let idx0 = vi % MEMORY_SIZE;
@@ -457,21 +535,24 @@ impl Interpreter {
                         };
                     }
                     0x55 => {
-                        // Saving registers
+                        // FX55: Store the values of registers V0 to VX inclusive in memory starting at address I.
+                        //       I is set to I + X + 1 after operation
+
                         let bound = n1(instr) as usize;
                         for i in 0..(bound + 1) {
                             self.memory[(self.vi + i as u16) as usize % MEMORY_SIZE] = self.registers[i];
                         }
-                        self.vi = self.vi + bound as u16 + 1;
+                        self.vi = self.vi.wrapping_add(bound as u16 + 1);
                     }
                     0x65 => {
-                        // Loading registers
-                        let bound = n1(instr) as usize;
+                        // FX65: Fill registers V0 to VX inclusive with the values stored in memory starting at address I.
+                        //       I is set to I + X + 1 after operation
 
+                        let bound = n1(instr) as usize;
                         for i in 0..(bound + 1) {
                             self.registers[i] = self.memory[(self.vi + i as u16) as usize % MEMORY_SIZE];
                         }
-                        self.vi = self.vi + bound as u16 + 1;
+                        self.vi = self.vi.wrapping_add(bound as u16 + 1);
                     }
                     _ => {
                         // TODO: proper error reporting
@@ -484,16 +565,16 @@ impl Interpreter {
         self.pc.wrapping_add(2)
     }
 
-    pub fn debug_screen(&self) {
-        debug_screen(&self.display);
+    pub fn print_debug_screen(&self) {
+        print_debug_screen(&self.display);
     }
 
-    pub fn core_dump(&self) {
-        core_dump(&self.memory)
+    pub fn print_core_dump(&self) {
+        print_core_dump(&self.memory)
     }
 }
 
-fn core_dump(memory: &[u8; MEMORY_SIZE]) {
+fn print_core_dump(memory: &[u8; MEMORY_SIZE]) {
     let row_size = 32;
     println!("BEGIN CORE DUMP");
     let mut was_all_zeros = false;
@@ -511,7 +592,7 @@ fn core_dump(memory: &[u8; MEMORY_SIZE]) {
     println!("END CORE DUMP");
 }
 
-fn debug_screen(display: &[u8; 256]) {
+fn print_debug_screen(display: &[u8; 256]) {
     fn to_chars(b: u8) -> String {
         let mut rv = String::new();
         for i in (0..8).rev() {
